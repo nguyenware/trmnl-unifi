@@ -23,6 +23,7 @@ private plugin (Full tab). Variables come from unifi_dashboard.py.
           {% case internet %}{% when "up" %}✓ Online{% when "degraded" %}! Degraded{% when "down" %}✗ Offline{% else %}Online{% endcase %}
         </span>
         <span class="label">{{ isp | default: gateway }}{% if wan_uptime %} · {{ wan_uptime }}% uptime{% endif %}</span>
+        {% if why and why != "" %}<span class="description clamp--1">{{ why }}</span>{% endif %}
       </div></div>
     </div>
     <div class="column">

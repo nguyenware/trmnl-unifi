@@ -170,7 +170,7 @@ def test_dashboard_end_to_end(config):
     assert dash["isp"] == "Ziply Fiber"
     assert dash["wan_uptime"] == 99.9
     assert dash["latency"] == 10
-    assert dash["down"] == 246 and dash["up"] == 12.3
+    assert dash["down"] == 246 and dash["up"] == 12
     assert dash["cpu"] == 12 and dash["mem"] == 62
     assert dash["uptime"] == "3d 5h"
     assert dash["clients"] == {"wifi": 4, "wired": 2, "vpn": 1, "guest": 1, "total": 7}
@@ -404,7 +404,7 @@ def test_udm_se_gateway_found_by_mac(config):
     assert dash["gateway"] == "Dream Machine Pro…"  # names are shortened to fit
     assert dash["internet"] == "up"
     assert dash["cpu"] == 12 and dash["uptime"] == "3d 5h"  # official statistics still preferred
-    assert dash["down"] == 950 and dash["up"] == 12.3  # WAN rates from classic health, bytes/s -> Mbps
+    assert dash["down"] == 950 and dash["up"] == 12  # WAN rates from classic health, bytes/s -> Mbps
     assert dash["isp"] == "Ziply Fiber"
 
 
@@ -447,3 +447,20 @@ def test_pick_cloud_site_by_mac():
     assert ud.pick_cloud_site([a, b], local, gateway_mac="BB:BB:BB:BB:BB:BB") is b
     assert ud.pick_cloud_site([a, b], local) is None
     assert ud.pick_cloud_site([a, b], local, gateway_mac="cc:cc:cc:cc:cc:cc") is None
+
+
+def test_status_reasons(config):
+    dash = build(config, cloud=cloud_routes(latencies=[10, 12], loss=[0, 3]))
+    assert (dash["internet"], dash["why"]) == ("degraded", "packet loss 3%")
+    dash = build(config, cloud=cloud_routes(issues=[{"type": "high_latency", "wanId": "WAN"}]))
+    assert (dash["internet"], dash["why"]) == ("degraded", "high latency")
+    dash = build(config, cloud=cloud_routes(issues=[{"wanId": "WAN"}, {}]))
+    assert dash["why"] == "UniFi reports 2 internet issues"
+    assert build(config)["why"] == ""
+    devices = [device(GW, "UDM", ["gateway"], state="CONNECTION_INTERRUPTED")]
+    assert build(config, local=local_routes(devices=devices, clients=[]))["why"] == "gateway connection interrupted"
+
+
+def test_mbps_rounding():
+    assert ud.mbps(9_440_000) == 9.4
+    assert ud.mbps(20_040_000) == 20

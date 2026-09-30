@@ -219,7 +219,7 @@ def mbps(bps):
     if bps is None:
         return None
     value = bps / 1_000_000
-    return round(value, 1) if value < 100 else round(value)
+    return round(value, 1) if value < 10 else round(value)
 
 
 def pct(value):
@@ -304,7 +304,7 @@ def fetch_cloud(config, local_site, cloud, gateway_mac=""):
     result = {
         "isp": (stats.get("ispInfo") or {}).get("name", ""),
         "wan_uptime": (stats.get("percentages") or {}).get("wanUptime"),
-        "issues": len(stats.get("internetIssues") or []),
+        "issues": stats.get("internetIssues") or [],
         "alerts": counts.get("criticalNotification", 0),
         "gateway_offline": counts.get("offlineGatewayDevice", 0),
     }
@@ -435,18 +435,33 @@ def find_gateway(devices, wan):
     return next((d for d in devices if norm_mac(d.get("macAddress")) == norm_mac(wan["gw_mac"])), None)
 
 
-def internet_status(cloud, gateway, www):
-    """up / degraded / down / unknown for the headline."""
-    if cloud.get("gateway_offline") or (gateway is not None and gateway.get("state") != "ONLINE"):
-        return "down"
+def describe_issues(issues):
+    """A short reason from the cloud's internetIssues list, whose item format isn't documented."""
+    for issue in issues:
+        for key in ("type", "reason", "name", "issue", "title"):
+            if isinstance(issue, dict) and isinstance(issue.get(key), str) and issue[key]:
+                return short(issue[key].replace("_", " "), 30)
+    return f"UniFi reports {len(issues)} internet issue{'s' if len(issues) != 1 else ''}"
+
+
+def internet_status(cloud, gateway, www):  # pylint: disable=too-many-return-statements
+    """(status, reason): up / degraded / down / unknown for the headline, and why if it isn't up."""
+    if cloud.get("gateway_offline"):
+        return "down", "gateway offline"
+    if gateway is not None and gateway.get("state") != "ONLINE":
+        return "down", f"gateway {gateway.get('state', '').lower().replace('_', ' ')}"
     www_status = www.get("status")
     if www_status == "error":
-        return "down"
+        return "down", "no internet (UniFi health check)"
     if not cloud and not www_status and gateway is None:
-        return "unknown"
-    if www_status == "warning" or cloud.get("issues") or cloud.get("loss"):
-        return "degraded"
-    return "up" if cloud or www_status == "ok" or gateway is not None else "unknown"
+        return "unknown", ""
+    if cloud.get("loss"):
+        return "degraded", f"packet loss {cloud['loss']}%"
+    if cloud.get("issues"):
+        return "degraded", describe_issues(cloud["issues"])
+    if www_status == "warning":
+        return "degraded", "UniFi health warning"
+    return ("up" if cloud or www_status == "ok" or gateway is not None else "unknown"), ""
 
 
 def build_dashboard(config, local=None, cloud_api=None):  # pylint: disable=too-many-locals
@@ -493,6 +508,7 @@ def build_dashboard(config, local=None, cloud_api=None):  # pylint: disable=too-
     offline = [d for d in devices if d.get("state") != "ONLINE"]
     gateway_mac = (gateway or {}).get("macAddress") or wan.get("gw_mac", "")
     cloud = build_cloud(config, site, cloud_api, gateway_mac)
+    status, why = internet_status(cloud, gateway, www)
     uplink = gw_stats.get("uplink") or {}
     gw_system = wan.get("gw_system-stats") or {}
     # Classic health reports WAN rates in bytes/s; the official uplink rate is the fallback.
@@ -503,7 +519,8 @@ def build_dashboard(config, local=None, cloud_api=None):  # pylint: disable=too-
         "updated": int(time.time()),
         "time": datetime.now().strftime(config.time_format).lstrip("0"),
         "site": site.get("name", ""),
-        "internet": internet_status(cloud, gateway, www),
+        "internet": status,
+        "why": why,
         "isp": cloud.get("isp") or wan.get("isp_name", ""),
         "wan_uptime": cloud.get("wan_uptime"),
         "latency": cloud.get("latency") if cloud.get("latency") is not None else www.get("latency"),
@@ -572,7 +589,8 @@ def run_push(config):
             dashboard = build_dashboard(config)
             push(config, dashboard)
             failures = 0
-            print(f"Pushed internet={dashboard['internet']} latency={dashboard['latency']}ms "
+            print(f"Pushed internet={dashboard['internet']}"
+                  f"{' (' + dashboard['why'] + ')' if dashboard.get('why') else ''} latency={dashboard['latency']}ms "
                   f"clients={dashboard['clients']['total']} devices={dashboard['online']}/{dashboard['devices']}",
                   flush=True)
         except (requests.RequestException, OSError, ValueError, RuntimeError, KeyError) as error:
@@ -634,6 +652,18 @@ def check_classic(config, local, ref):
             print(f"  {name}: classic API not available with this key ({error}); set SHOW_{name.upper()}=0")
 
 
+def check_internet(local, ref):
+    """Prints the console's own internet health and returns the gateway MAC ("" if unavailable)."""
+    try:
+        health = local.health(ref)
+    except (requests.RequestException, ValueError):
+        return ""
+    www = subsystem(health, "www")
+    print(f"  Internet (UniFi health): status={www.get('status')} latency={www.get('latency')}ms "
+          f"drops={www.get('drops')}")
+    return subsystem(health, "wan").get("gw_mac", "")
+
+
 def run_check(config):
     """Tests both APIs and prints what was found."""
     ok = True
@@ -645,10 +675,7 @@ def run_check(config):
         print(f"  site: {site.get('name')} ({site.get('internalReference')}), {len(devices)} devices")
         ref = site.get("internalReference") or "default"
         check_classic(config, local, ref)
-        try:
-            gateway_mac = subsystem(local.health(ref), "wan").get("gw_mac", "")
-        except (requests.RequestException, ValueError):
-            gateway_mac = ""
+        gateway_mac = check_internet(local, ref)
     except (requests.RequestException, ValueError, RuntimeError) as error:
         print(f"  local API FAILED: {error}")
         return False
@@ -667,6 +694,9 @@ def run_check(config):
         if match is None:
             print("  No match; set UNIFI_CLOUD_SITE_ID to one of the ids above")
             ok = False
+        else:
+            issues = (match.get("statistics") or {}).get("internetIssues") or []
+            print(f"  internetIssues: {json.dumps(issues)[:600]}")
     except (requests.RequestException, ValueError) as error:
         print(f"  cloud API FAILED: {error}")
         ok = False

@@ -139,6 +139,7 @@ The variables available in the markup:
 |---|---|---|
 | `status` | `ok` | `error` when the console is unreachable; then only `error` and `updated` are set. |
 | `internet` | `up` | `up`, `degraded` (packet loss or internet issues), `down` (gateway offline), or `unknown` (no cloud key). |
+| `why` | `packet loss 3%` | Why the status isn't `up`: packet loss, the cloud's internet issue, a UniFi health warning, or the gateway's state. Empty when up. |
 | `isp`, `wan_uptime` | `Ziply Fiber`, `99.9` | cloud |
 | `latency`, `latency_avg`, `latency_max` | `10`, `12`, `49` | ms; latest 5-minute sample, 24h average, 24h peak. |
 | `loss`, `loss_max`, `lossy` | `0`, `2`, `3` | packet loss % now and 24h max, and how many 5-minute intervals had any loss. |
