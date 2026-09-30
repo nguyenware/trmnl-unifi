@@ -37,6 +37,7 @@ LATENCY_POINTS = 48  # 24h of 5-minute samples averaged into 30-minute buckets
 MAX_LISTED = 4  # offline devices named on screen
 MAX_APS = 6
 NAME_LEN = 18
+POE_HOT_PCT = 80  # name a device on screen once its PoE draw reaches this share of its budget
 
 
 def load_dotenv(path):
@@ -78,6 +79,7 @@ class Config:  # pylint: disable=too-many-instance-attributes,too-few-public-met
         self.webhook_url = os.environ.get("TRMNL_WEBHOOK_URL", "").strip()
         self.interval = int(os.environ.get("PUSH_INTERVAL", "") or 300)
         self.payload_limit = int(os.environ.get("PAYLOAD_LIMIT", "") or 2048)
+        self.show_poe = env_flag("SHOW_POE", True)
         self.time_format = os.environ.get("TIME_FORMAT", "%I:%M %p")
         self.listen_host = os.environ.get("HOST", "0.0.0.0")
         self.port = int(os.environ.get("PORT", "") or 5000)
@@ -92,6 +94,7 @@ class LocalApi:
         if not config.host or not config.api_key:
             raise SystemExit("UNIFI_HOST and UNIFI_API_KEY are required")
         self.base = f"{config.host}/proxy/network/integration/v1"
+        self.legacy_base = f"{config.host}/proxy/network/api"
         self.session = session or requests.Session()
         self.session.headers.update({"X-API-Key": config.api_key, "Accept": "application/json"})
         self.session.verify = config.verify
@@ -111,6 +114,16 @@ class LocalApi:
             offset += len(data)
             if not data or offset >= page.get("totalCount", 0):
                 return items
+
+    def legacy_devices(self, site_ref):
+        """Raw devices from the undocumented classic API, the only source of PoE watts.
+
+        UniFi OS accepts the same X-API-Key here, but Ubiquiti doesn't document
+        or guarantee it.
+        """
+        response = self.session.get(f"{self.legacy_base}/s/{site_ref}/stat/device", timeout=20)
+        response.raise_for_status()
+        return response.json().get("data") or []
 
     def site(self, wanted=""):
         """The site matching UNIFI_SITE (name, internal reference or id), else the first one."""
@@ -289,6 +302,69 @@ def fetch_cloud(config, local_site, cloud):
     return result
 
 
+def to_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def summarize_poe(legacy_devices):
+    """PoE draw against budget, from classic /stat/device records.
+
+    Devices that report a budget (total_max_power) make up the bar. Draw on
+    devices without one, such as some gateways, is reported separately.
+    Returns None when nothing supplies PoE.
+    """
+    used = budget = other = 0.0
+    hot, found = [], False
+    for dev in legacy_devices:
+        ports = [p for p in dev.get("port_table") or [] if p.get("port_poe")]
+        max_power = to_float(dev.get("total_max_power")) or 0
+        if not ports and not max_power:
+            continue
+        found = True
+        draw = to_float(dev.get("total_used_power"))
+        if draw is None:
+            draw = sum(to_float(p.get("poe_power")) or 0 for p in ports)
+        if max_power:
+            used += draw
+            budget += max_power
+            share = 100 * draw / max_power
+            if share >= POE_HOT_PCT:
+                hot.append((share, f"{short(dev.get('name') or dev.get('model'))} {round(share)}%"))
+        else:
+            other += draw
+    if not found:
+        return None
+    return {
+        "w": round(used),
+        "max": round(budget) or None,
+        "pct": round(100 * used / budget) if budget else None,
+        "other": round(other),
+        "hot": max(hot)[1] if hot else "",
+    }
+
+
+_POE_WARNED = []
+
+
+def build_poe(config, local, site):
+    """PoE summary, or None if disabled or the classic API isn't reachable with the key."""
+    if not config.show_poe:
+        return None
+    try:
+        poe = summarize_poe(local.legacy_devices(site.get("internalReference") or "default"))
+        _POE_WARNED.clear()
+        return poe
+    except (requests.RequestException, ValueError) as error:
+        if not _POE_WARNED:  # once per outage, not every push
+            print(f"PoE data unavailable (classic API): {error}; set SHOW_POE=0 to stop trying",
+                  file=sys.stderr, flush=True)
+            _POE_WARNED.append(True)
+        return None
+
+
 def internet_status(cloud, gateway):
     """up / degraded / down / unknown for the headline."""
     if gateway is None or gateway.get("state") != "ONLINE" or cloud.get("gateway_offline"):
@@ -371,6 +447,7 @@ def build_dashboard(config, local=None, cloud_api=None):  # pylint: disable=too-
                     for d in offline[:MAX_LISTED]],
         "updates": sum(1 for d in devices if d.get("firmwareUpdatable")),
         "aps": aps[:MAX_APS],
+        "poe": build_poe(config, local, site),
     }
     return dashboard
 
@@ -386,6 +463,8 @@ def fit(dashboard, limit):
         dashboard["aps"].pop()
     while size() > limit and dashboard.get("offline"):
         dashboard["offline"].pop()
+    if size() > limit and dashboard.get("poe"):
+        dashboard["poe"]["hot"] = ""
     return dashboard
 
 
@@ -457,6 +536,12 @@ def run_check(config):
         site = local.site(config.site)
         devices = local.get_all(f"/sites/{site['id']}/devices")
         print(f"  site: {site.get('name')} ({site.get('internalReference')}), {len(devices)} devices")
+        if config.show_poe:
+            try:
+                poe = summarize_poe(local.legacy_devices(site.get("internalReference") or "default"))
+                print(f"  PoE: {poe}" if poe else "  PoE: no PoE devices found")
+            except (requests.RequestException, ValueError) as error:
+                print(f"  PoE: classic API not available with this key ({error}); set SHOW_POE=0")
     except (requests.RequestException, ValueError, RuntimeError) as error:
         print(f"  local API FAILED: {error}")
         return False

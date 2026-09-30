@@ -7,6 +7,7 @@ private plugin (Full tab). Variables come from unifi_dashboard.py.
 .uf-status { font-size: 44px; line-height: 1.05; white-space: nowrap; }
 .uf-box { border: 3px solid black; padding: 0 10px; }
 .uf-nowrap { white-space: nowrap; }
+.uf-poe { width: 100%; margin-top: 4px; }
 .uf-chart { width: 100%; height: 150px; }
 .uf-list { display: flex; flex-direction: column; gap: 2px; }
 .uf-row { display: flex; justify-content: space-between; gap: 8px; }
@@ -71,6 +72,19 @@ private plugin (Full tab). Variables come from unifi_dashboard.py.
         <span class="value value--small value--tnums uf-nowrap">{{ cpu | default: "–" }}% · {{ mem | default: "–" }}%</span>
         <span class="label">CPU · Memory</span>
         <span class="description">{% if uptime != "" %}Gateway up {{ uptime }}{% else %}{{ gateway }}{% endif %}</span>
+        {% if poe %}
+          {% if poe.max %}
+          <div class="progress-bar progress-bar--xsmall progress-bar--emphasis-3 uf-poe">
+            <div class="content">
+              <span class="label label--small uf-nowrap">PoE {{ poe.w }} / {{ poe.max }} W{% if poe.other > 0 %} +{{ poe.other }} W{% endif %}</span>
+            </div>
+            <div class="track"><div class="fill" style="width: {{ poe.pct | at_most: 100 }}%"></div></div>
+          </div>
+          {% else %}
+          <span class="description uf-nowrap">PoE {{ poe.other }} W</span>
+          {% endif %}
+          {% if poe.hot != "" %}<span class="description clamp--1">! {{ poe.hot }}</span>{% endif %}
+        {% endif %}
       </div></div>
     </div>
     {% if aps.size > 0 %}

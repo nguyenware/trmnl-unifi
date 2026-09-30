@@ -54,6 +54,21 @@ def client(kind, uplink=None, access="DEFAULT"):
 
 
 LOCAL_BASE = "/proxy/network/integration/v1"
+LEGACY_DEVICES = "/proxy/network/api/s/default/stat/device"
+
+
+def poe_port(idx, watts, poe=True):
+    # The classic API reports watts as strings, and "0.00" even on ports without PoE.
+    return {"port_idx": idx, "port_poe": poe, "poe_enable": poe, "poe_power": f"{watts:.2f}"}
+
+
+LEGACY = {"meta": {"rc": "ok"}, "data": [
+    {"name": "Dream Machine Pro SE", "model": "UDMPROSE",  # PoE ports but no reported budget
+     "port_table": [poe_port(1, 6.5), poe_port(2, 5.2), poe_port(9, 0, poe=False)]},
+    {"name": "USW Pro Max 24 PoE", "model": "USPM24P", "total_max_power": 400, "total_used_power": 87.4,
+     "port_table": [poe_port(1, 40), poe_port(2, 47.4)]},
+    {"name": "Flex Mini", "model": "USWFLEXMINI", "port_table": [poe_port(1, 0, poe=False)]},
+]}
 
 
 def local_routes(devices=None, clients=None):
@@ -70,6 +85,7 @@ def local_routes(devices=None, clients=None):
         f"{LOCAL_BASE}/sites": page([{"id": SITE_ID, "internalReference": "default", "name": "Default"}]),
         f"{LOCAL_BASE}/sites/{SITE_ID}/devices": page(devices),
         f"{LOCAL_BASE}/sites/{SITE_ID}/clients": page(clients),
+        LEGACY_DEVICES: LEGACY,
         f"{LOCAL_BASE}/sites/{SITE_ID}/devices/{GW}/statistics/latest": {
             "uptimeSec": 3 * 86400 + 5 * 3600, "cpuUtilizationPct": 12.4, "memoryUtilizationPct": 61.6,
             "uplink": {"rxRateBps": 245_600_000, "txRateBps": 12_300_000}},
@@ -149,6 +165,7 @@ def test_dashboard_end_to_end(config):
     assert dash["aps"] == [{"n": "Living Room", "c": 4, "on": True, "r": 8},
                            {"n": "Garage AP", "c": 0, "on": False}]
     assert len(dash["lat"]) == 48
+    assert dash["poe"] == {"w": 87, "max": 400, "pct": 22, "other": 12, "hot": ""}
 
 
 def test_dashboard_without_cloud_key(config):
@@ -272,3 +289,41 @@ def test_typical_payload_fits_2kb(config):
     dash["aps"] = [{"n": "Access point name", "c": 30, "on": True, "r": 12} for _ in range(6)]
     body = json.dumps({"merge_variables": dash}, separators=(",", ":"), ensure_ascii=False).encode()
     assert len(body) <= 2048
+
+
+def test_poe_uses_port_sum_without_total_and_flags_hot_switch():
+    poe = ud.summarize_poe([
+        {"name": "Garage Switch", "total_max_power": 52, "port_table": [poe_port(1, 23.1), poe_port(2, 21.5)]},
+        {"name": "Office Switch", "total_max_power": 400, "total_used_power": 60},
+    ])
+    assert poe == {"w": 105, "max": 452, "pct": 23, "other": 0, "hot": "Garage Switch 86%"}
+
+
+def test_poe_without_any_budget():
+    poe = ud.summarize_poe(LEGACY["data"][:1])
+    assert poe == {"w": 0, "max": None, "pct": None, "other": 12, "hot": ""}
+
+
+def test_no_poe_devices():
+    assert ud.summarize_poe([{"name": "AP", "port_table": [poe_port(1, 0, poe=False)]}]) is None
+    assert ud.summarize_poe([]) is None
+
+
+def test_classic_api_rejected_skips_poe(config, capsys):
+    routes = local_routes()
+    del routes[LEGACY_DEVICES]  # 404, like a console that refuses the key there
+    ud._POE_WARNED.clear()
+    first = build(config, local=routes)
+    second = build(config, local=routes)
+    assert first["poe"] is None and second["poe"] is None
+    assert first["status"] == "ok" and first["clients"]["total"] == 7
+    assert capsys.readouterr().err.count("PoE data unavailable") == 1
+
+
+def test_show_poe_off_skips_classic_api(config):
+    config.show_poe = False
+    session = FakeSession(local_routes())
+    config.cloud_key = ""
+    dash = ud.build_dashboard(config, ud.LocalApi(config, session))
+    assert dash["poe"] is None
+    assert LEGACY_DEVICES not in [path for path, _ in session.calls]

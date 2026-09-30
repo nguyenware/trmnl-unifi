@@ -28,12 +28,19 @@ a compact summary to a TRMNL *webhook* private plugin. No port forwarding or tun
 | Clients (Wi-Fi / wired / VPN / guest) | `GET /v1/sites/{id}/clients` |
 | Devices online, offline devices, updates | `GET /v1/sites/{id}/devices` (`state`, `firmwareUpdatable`) |
 | Clients and Tx retry % per access point | clients' `uplinkDeviceId` + each AP's `statistics/latest` |
+| PoE watts used / budget | classic `GET /proxy/network/api/s/{site}/stat/device` (see below) |
 
 The cloud key is optional. Without it you still get everything from the console, but no ISP name, latency
 chart or packet loss.
 
 The official APIs don't expose Wi-Fi signal strength, per-client bandwidth or speed test results, so those
 aren't shown.
+
+**PoE comes from UniFi's older, undocumented API**, because the official one only reports whether a port
+supplies power, not how many watts. UniFi OS accepts the same API key there, but Ubiquiti doesn't
+guarantee that. If your console rejects it, `check` says so, one line is logged, and the dashboard shows
+everything except PoE. Switches report a PoE budget (`total_max_power`); gateways may not, so their
+PoE draw is shown as "+N W" beside the bar rather than in it.
 
 ## Setup
 
@@ -92,6 +99,7 @@ journalctl -u trmnl-unifi -f      # expect "Pushed internet=up latency=..." ever
 | `UNIFI_VERIFY_SSL` | `0` | Consoles use a self-signed certificate. Set `1` if yours has a trusted one. |
 | `UNIFI_CA_BUNDLE` | – | Path to a CA file to verify the console's certificate. |
 | `UNIFI_CLOUD_API_KEY` | – | Site Manager key. Adds ISP, WAN uptime, latency and packet loss. |
+| `SHOW_POE` | `1` | `0` stops reading PoE from the classic API. |
 | `UNIFI_CLOUD_SITE_ID` | auto | Only needed with several consoles if `check` can't match the site. |
 | `PUSH_INTERVAL` | `300` | Seconds. TRMNL allows 12 webhook posts per hour (30 with TRMNL+), so don't go below 300 (120 with TRMNL+). |
 | `PAYLOAD_LIMIT` | `2048` | Webhook body limit in bytes; `5120` with TRMNL+. A typical payload is under 1 KB. |
@@ -131,6 +139,7 @@ The variables available in the markup:
 | `devices`, `online`, `offline` | `6`, `5`, `["Garage U6 Mesh (connection interrupted)"]` | up to 4 names |
 | `updates`, `alerts` | `1`, `0` | devices with firmware updates, critical notifications (cloud) |
 | `aps` | `[{"n": "Living Room", "c": 25, "on": true, "r": 8}]` | name, clients, online, highest Tx retry % across radios; up to 6, busiest first |
+| `poe` | `{"w": 87, "max": 400, "pct": 22, "other": 12, "hot": ""}` | PoE watts drawn and budget over devices that report a budget, % of budget, watts on devices without a budget (e.g. the gateway's own PoE ports), and the name and % of any device at 80%+ of its budget. `null` if unavailable or `SHOW_POE=0`. |
 | `site`, `time`, `updated` | `Default`, `5:56 AM`, `1790747811` | |
 
 ## Development
