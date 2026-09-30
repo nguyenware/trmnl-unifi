@@ -1,0 +1,18 @@
+# systemd unit for pushing the UniFi dashboard to TRMNL.
+# Installed by install.sh; see README.md.
+[Unit]
+Description=TRMNL UniFi dashboard (UniFi API -> TRMNL webhook)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trmnl-unifi
+WorkingDirectory=/opt/trmnl-unifi
+ExecStart=/opt/trmnl-unifi/.venv/bin/python unifi_dashboard.py push
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

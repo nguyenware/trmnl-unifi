@@ -1,0 +1,144 @@
+{% comment %}
+UniFi dashboard - full layout. Paste into the "Markup" editor of a TRMNL
+private plugin (Full tab). Variables come from unifi_dashboard.py.
+{% endcomment %}
+<script src="https://trmnl.com/js/highcharts/12.3.0/highcharts.js"></script>
+<style>
+.uf-status { font-size: 44px; line-height: 1.05; white-space: nowrap; }
+.uf-box { border: 3px solid black; padding: 0 10px; }
+.uf-nowrap { white-space: nowrap; }
+.uf-chart { width: 100%; height: 150px; }
+.uf-list { display: flex; flex-direction: column; gap: 2px; }
+.uf-row { display: flex; justify-content: space-between; gap: 8px; }
+.uf-row .label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+</style>
+
+<div class="layout layout--col gap--space-between">
+{% if status == "ok" %}
+  <div class="columns">
+    <div class="column">
+      <div class="item"><div class="meta"></div><div class="content">
+        <span class="value uf-status {% if internet == 'down' %}uf-box{% endif %}">
+          {% case internet %}{% when "up" %}✓ Online{% when "degraded" %}! Degraded{% when "down" %}✗ Offline{% else %}Online{% endcase %}
+        </span>
+        <span class="label">{{ isp | default: gateway }}{% if wan_uptime %} · {{ wan_uptime }}% uptime{% endif %}</span>
+      </div></div>
+    </div>
+    <div class="column">
+      <div class="item"><div class="meta"></div><div class="content">
+        <span class="value value--tnums uf-nowrap">{% if latency %}{{ latency }} ms{% else %}–{% endif %}</span>
+        <span class="label">Latency{% if loss and loss > 0 %} · {{ loss }}% loss{% endif %}</span>
+      </div></div>
+    </div>
+    <div class="column">
+      <div class="item"><div class="meta"></div><div class="content">
+        <span class="value value--tnums uf-nowrap">↓{{ down | default: "–" }} ↑{{ up | default: "–" }}</span>
+        <span class="label">Mbps now</span>
+      </div></div>
+    </div>
+  </div>
+
+  {% if lat.size > 1 %}
+  <div class="w--full">
+    <span class="label label--small">
+      Latency, last 24h · avg {{ latency_avg }} ms · peak {{ latency_max }} ms{% if lossy and lossy > 0 %} · packet loss in {{ lossy }} × 5 min (max {{ loss_max }}%){% endif %}
+    </span>
+    <div id="uf-latency" class="uf-chart"></div>
+  </div>
+  {% endif %}
+
+  <div class="divider"></div>
+
+  <div class="columns">
+    <div class="column">
+      <div class="item"><div class="meta"></div><div class="content">
+        <span class="value value--tnums">{{ clients.total }}</span>
+        <span class="label">Clients</span>
+        <span class="description">{{ clients.wifi }} Wi-Fi · {{ clients.wired }} wired{% if clients.vpn > 0 %} · {{ clients.vpn }} VPN{% endif %}{% if clients.guest > 0 %} · {{ clients.guest }} guest{% endif %}</span>
+      </div></div>
+    </div>
+    <div class="column">
+      <div class="item"><div class="meta"></div><div class="content">
+        <span class="value value--tnums {% if online < devices %}uf-box{% endif %}">{{ online }}/{{ devices }}</span>
+        <span class="label">Devices online</span>
+        {% for name in offline %}<span class="description clamp--1">✗ {{ name }}</span>{% endfor %}
+        {% if updates > 0 %}<span class="description">{{ updates }} update{% if updates > 1 %}s{% endif %} available</span>{% endif %}
+        {% if alerts > 0 %}<span class="description">{{ alerts }} critical alert{% if alerts > 1 %}s{% endif %}</span>{% endif %}
+      </div></div>
+    </div>
+    <div class="column">
+      <div class="item"><div class="meta"></div><div class="content">
+        <span class="value value--small value--tnums uf-nowrap">{{ cpu | default: "–" }}% · {{ mem | default: "–" }}%</span>
+        <span class="label">CPU · Memory</span>
+        <span class="description">{% if uptime != "" %}Gateway up {{ uptime }}{% else %}{{ gateway }}{% endif %}</span>
+      </div></div>
+    </div>
+    {% if aps.size > 0 %}
+    <div class="column">
+      <div class="uf-list">
+        <div class="uf-row">
+          <span class="label label--small label--underline">Access point</span>
+          <span class="label label--small label--underline uf-nowrap">Clients · retry</span>
+        </div>
+        {% for ap in aps %}
+        <div class="uf-row">
+          <span class="label label--small">{% unless ap.on %}✗ {% endunless %}{{ ap.n }}</span>
+          <span class="label label--small uf-nowrap">{{ ap.c }}{% if ap.r %} · {{ ap.r }}%{% endif %}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+{% else %}
+  <div class="flex flex--col flex--center stretch">
+    <span class="value value--xlarge">UniFi unreachable</span>
+    <span class="description">{{ error }}</span>
+  </div>
+{% endif %}
+</div>
+
+<div class="title_bar">
+  <span class="title">UniFi{% if site and site != "" %} · {{ site }}{% endif %}</span>
+  {% if status == "ok" %}<span class="instance">{{ time }}</span>{% endif %}
+</div>
+
+{% if status == "ok" and lat.size > 1 %}
+<script type="text/javascript">
+  // Oldest first; one point per 30 minutes over the last 24 hours. Gaps are null.
+  var latency = {{ lat | json }};
+
+  function whenReady(cb) {
+    var tries = 0;
+    (function attempt() {
+      if (window.Highcharts && (window.TRMNLCharts || tries > 40)) return cb();
+      if (++tries > 200) return;
+      setTimeout(attempt, 50);
+    })();
+  }
+
+  whenReady(function () {
+    var el = "uf-latency";
+    var build = function () {
+      var options = {
+        chart: { type: "line", animation: false, height: 150, spacing: [4, 4, 4, 4] },
+        title: { text: null }, legend: { enabled: false }, credits: { enabled: false },
+        tooltip: { enabled: false },
+        plotOptions: { series: { animation: false, lineWidth: 3, marker: { enabled: false },
+                                 enableMouseTracking: false, connectNulls: false } },
+        xAxis: { visible: false },
+        yAxis: { title: { text: null }, min: 0, tickAmount: 3, gridLineDashStyle: "shortdot" },
+        series: [{ data: latency }]
+      };
+      if (window.TRMNLCharts) {
+        options = TRMNLCharts.merge(TRMNLCharts.options({ el: el }), options);
+        options.series[0].color = TRMNLCharts.series(0, 1, { el: el });
+      } else {
+        options.series[0].color = "#000000";
+      }
+      return Highcharts.chart(el, options);
+    };
+    if (window.TRMNLCharts && TRMNLCharts.watch) { TRMNLCharts.watch(el, build); } else { build(); }
+  });
+</script>
+{% endif %}
