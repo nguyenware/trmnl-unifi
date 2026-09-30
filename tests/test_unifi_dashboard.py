@@ -186,15 +186,15 @@ def test_dashboard_end_to_end(config):
 
 def test_dashboard_without_cloud_key(config):
     dash = build(config, cloud_key="")
-    assert dash["internet"] == "unknown"
-    assert dash["latency"] is None and dash["lat"] == []
+    assert dash["internet"] == "up"  # from classic health's www status
+    assert dash["latency"] == 9 and dash["lat"] == []  # www latency stands in for the cloud's
     assert dash["down"] == 246
 
 
 def test_cloud_outage_keeps_local_data(config):
     dash = build(config, cloud={})  # every cloud request returns 404
     assert dash["status"] == "ok"
-    assert dash["internet"] == "unknown"
+    assert dash["internet"] == "up"
     assert dash["clients"]["total"] == 7 and dash["down"] == 246
 
 
@@ -371,4 +371,79 @@ def test_classic_api_rejected_skips_speedtest(config, capsys):
     ud._WARNED.clear()
     dash = build(config, local=routes)
     assert dash["speedtest"] is None and dash["poe"] is not None
-    assert "set SHOW_SPEEDTEST=0" in capsys.readouterr().err
+    assert "Health data unavailable" in capsys.readouterr().err
+
+
+GW_MAC = "28:70:4E:85:A9:E9"
+
+
+def wan_health(**extra):
+    # Shaped like a real UniFi OS stat/health "wan" entry (unpoller endpoints_data/stat-health.json).
+    entry = {"subsystem": "wan", "status": "ok", "wan_ip": "203.0.113.7", "gw_mac": GW_MAC.lower(),
+             "gw_name": "Dream Machine Pro SE", "isp_name": "Ziply Fiber",
+             "gw_system-stats": {"cpu": "5.6", "mem": "67.2", "uptime": "492633"},
+             "tx_bytes-r": 1_537_500, "rx_bytes-r": 118_750_000}
+    entry.update(extra)
+    return entry
+
+
+def udm_se_routes(gateway_listed=True):
+    """A UDM Pro SE whose official device entry lacks the "gateway" feature."""
+    devices = [device(AP1, "Garage", ["accessPoint"]), device(SW, "Office Switch", ["switching"])]
+    if gateway_listed:
+        gw = device(GW, "Dream Machine Pro SE", ["switching"])
+        gw["macAddress"] = GW_MAC
+        devices.insert(0, gw)
+    routes = local_routes(devices=devices)
+    routes[LEGACY_HEALTH] = lambda _p: {"data": [wan_health(), www_health(time.time() - 60)]}
+    return routes
+
+
+def test_udm_se_gateway_found_by_mac(config):
+    dash = build(config, local=udm_se_routes(), cloud_key="")
+    assert dash["gateway"] == "Dream Machine Pro…"  # names are shortened to fit
+    assert dash["internet"] == "up"
+    assert dash["cpu"] == 12 and dash["uptime"] == "3d 5h"  # official statistics still preferred
+    assert dash["down"] == 950 and dash["up"] == 12.3  # WAN rates from classic health, bytes/s -> Mbps
+    assert dash["isp"] == "Ziply Fiber"
+
+
+def test_gateway_missing_from_official_list_uses_health(config):
+    dash = build(config, local=udm_se_routes(gateway_listed=False), cloud_key="")
+    assert dash["gateway"] == "Dream Machine Pro…"  # names are shortened to fit
+    assert dash["cpu"] == 6 and dash["mem"] == 67 and dash["uptime"] == "5d 16h"
+    assert dash["internet"] == "up"
+
+
+def test_no_gateway_no_health_no_cloud_is_unknown(config):
+    routes = local_routes(devices=[device(AP1, "AP", ["accessPoint"])])
+    del routes[LEGACY_HEALTH]
+    ud._WARNED.clear()
+    dash = build(config, local=routes, cloud_key="")
+    assert dash["internet"] == "unknown"
+    assert dash["gateway"] == "" and dash["cpu"] is None
+
+
+def test_www_error_means_down(config):
+    routes = local_routes()
+    routes[LEGACY_HEALTH] = lambda _p: {"data": [dict(www_health(time.time()), status="error")]}
+    assert build(config, local=routes, cloud_key="")["internet"] == "down"
+
+
+def test_cloud_site_matched_by_gateway_mac(config):
+    # Two consoles on one account, both with a site called "Default (default)".
+    old = {"siteId": "old", "meta": {"name": "default", "desc": "Default", "gatewayMac": "70:a7:41:00:00:01"}}
+    cloud = cloud_routes()
+    cloud["/v1/sites"]["data"][0]["meta"]["gatewayMac"] = GW_MAC.lower()
+    cloud["/v1/sites"]["data"].insert(0, old)
+    dash = build(config, local=udm_se_routes(), cloud=cloud)
+    assert dash["isp"] == "Ziply Fiber" and dash["wan_uptime"] == 99.9 and len(dash["lat"]) == 48
+
+
+def test_pick_cloud_site_by_mac():
+    local = {"internalReference": "default", "name": "Default"}
+    a = {"siteId": "a", "meta": {"name": "default", "desc": "Default", "gatewayMac": "aa:aa:aa:aa:aa:aa"}}
+    b = {"siteId": "b", "meta": {"name": "default", "desc": "Default", "gatewayMac": "bb:bb:bb:bb:bb:bb"}}
+    assert ud.pick_cloud_site([a, b], local, gateway_mac="BB:BB:BB:BB:BB:BB") is b
+    assert ud.pick_cloud_site([a, b], local) is None
+    assert ud.pick_cloud_site([a, b], local, gateway_mac="cc:cc:cc:cc:cc:cc") is None

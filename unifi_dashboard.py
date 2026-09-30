@@ -172,12 +172,20 @@ class CloudApi:
         return self.get("/v1/isp-metrics/5m", duration="24h").get("data") or []
 
 
-def pick_cloud_site(sites, local_site, wanted_id=""):
-    """Matches the cloud site to the local one by id, internal name ("default") or display name."""
+def norm_mac(mac):
+    return (mac or "").lower().replace("-", ":")
+
+
+def pick_cloud_site(sites, local_site, wanted_id="", gateway_mac=""):
+    """Matches the cloud site to the local one by id, gateway MAC, or internal and display name."""
     if wanted_id:
         return next((s for s in sites if s.get("siteId") == wanted_id), None)
     if len(sites) == 1:
         return sites[0]
+    if gateway_mac:
+        by_mac = [s for s in sites if norm_mac((s.get("meta") or {}).get("gatewayMac")) == norm_mac(gateway_mac)]
+        if len(by_mac) == 1:
+            return by_mac[0]
     # Every console has a site called "default", so the display name must match too.
     ref = (local_site.get("internalReference") or "").lower()
     name = (local_site.get("name") or "").lower()
@@ -271,7 +279,7 @@ def summarize_isp(periods):
     }
 
 
-def build_cloud(config, local_site, cloud=None):
+def build_cloud(config, local_site, cloud=None, gateway_mac=""):
     """ISP / internet fields from the Site Manager API, or {} if it isn't configured or fails.
 
     A cloud outage shouldn't blank the dashboard, so errors are logged and the
@@ -280,14 +288,14 @@ def build_cloud(config, local_site, cloud=None):
     if not config.cloud_key:
         return {}
     try:
-        return fetch_cloud(config, local_site, cloud or CloudApi(config))
+        return fetch_cloud(config, local_site, cloud or CloudApi(config), gateway_mac)
     except (requests.RequestException, ValueError) as error:
         print(f"Cloud API failed, showing local data only: {error}", file=sys.stderr, flush=True)
         return {}
 
 
-def fetch_cloud(config, local_site, cloud):
-    site = pick_cloud_site(cloud.sites(), local_site, config.cloud_site_id)
+def fetch_cloud(config, local_site, cloud, gateway_mac=""):
+    site = pick_cloud_site(cloud.sites(), local_site, config.cloud_site_id, gateway_mac)
     if site is None:
         print("Could not match a cloud site; set UNIFI_CLOUD_SITE_ID", file=sys.stderr)
         return {}
@@ -307,6 +315,11 @@ def fetch_cloud(config, local_site, cloud):
             result.update(isp)
             break
     return result
+
+
+def first_number(*values):
+    """The first value that parses as a number (classic API numbers are often strings)."""
+    return next((f for f in map(to_float, values) if f is not None), None)
 
 
 def to_float(value):
@@ -384,7 +397,7 @@ def summarize_speedtest(health, now=None):
 _WARNED = set()
 
 
-def classic_feature(name, enabled, fetch):
+def classic_feature(name, enabled, fetch, flag=None):
     """Runs an optional classic-API feature; failures are logged once per outage and give None."""
     if not enabled:
         return None
@@ -394,9 +407,8 @@ def classic_feature(name, enabled, fetch):
         return result
     except (requests.RequestException, ValueError) as error:
         if name not in _WARNED:  # once per outage, not every push
-            flag = "SHOW_" + name.upper().replace(" ", "")
-            print(f"{name} data unavailable (classic API): {error}; set {flag}=0 to stop trying",
-                  file=sys.stderr, flush=True)
+            hint = f"; set {flag}=0 to stop trying" if flag else ""
+            print(f"{name} data unavailable (classic API): {error}{hint}", file=sys.stderr, flush=True)
             _WARNED.add(name)
         return None
 
@@ -404,24 +416,37 @@ def classic_feature(name, enabled, fetch):
 def build_poe(config, local, site):
     """PoE summary, or None if disabled or the classic API isn't reachable with the key."""
     ref = site.get("internalReference") or "default"
-    return classic_feature("PoE", config.show_poe, lambda: summarize_poe(local.legacy_devices(ref)))
+    return classic_feature("PoE", config.show_poe, lambda: summarize_poe(local.legacy_devices(ref)), "SHOW_POE")
 
 
-def build_speedtest(config, local, site):
-    """Last speed test, or None if disabled, never run, or the classic API isn't reachable."""
-    ref = site.get("internalReference") or "default"
-    return classic_feature("Speedtest", config.show_speedtest, lambda: summarize_speedtest(local.health(ref)))
+def subsystem(health, name):
+    return next((h for h in health or [] if h.get("subsystem") == name), {})
 
 
-def internet_status(cloud, gateway):
+def find_gateway(devices, wan):
+    """The gateway device: flagged by the official API, or matched by MAC from classic health.
+
+    Some consoles (seen on a UDM Pro SE running Network 10.6) don't list the
+    "gateway" feature, so the gw_mac from /stat/health is the fallback.
+    """
+    flagged = next((d for d in devices if "gateway" in (d.get("features") or [])), None)
+    if flagged or not wan.get("gw_mac"):
+        return flagged
+    return next((d for d in devices if norm_mac(d.get("macAddress")) == norm_mac(wan["gw_mac"])), None)
+
+
+def internet_status(cloud, gateway, www):
     """up / degraded / down / unknown for the headline."""
-    if gateway is None or gateway.get("state") != "ONLINE" or cloud.get("gateway_offline"):
+    if cloud.get("gateway_offline") or (gateway is not None and gateway.get("state") != "ONLINE"):
         return "down"
-    if not cloud:
+    www_status = www.get("status")
+    if www_status == "error":
+        return "down"
+    if not cloud and not www_status and gateway is None:
         return "unknown"
-    if cloud.get("issues") or cloud.get("loss"):
+    if www_status == "warning" or cloud.get("issues") or cloud.get("loss"):
         return "degraded"
-    return "up"
+    return "up" if cloud or www_status == "ok" or gateway is not None else "unknown"
 
 
 def build_dashboard(config, local=None, cloud_api=None):  # pylint: disable=too-many-locals
@@ -432,7 +457,10 @@ def build_dashboard(config, local=None, cloud_api=None):  # pylint: disable=too-
     devices = local.get_all(f"/sites/{site_id}/devices")
     clients = local.get_all(f"/sites/{site_id}/clients")
 
-    gateway = next((d for d in devices if "gateway" in (d.get("features") or [])), None)
+    ref = site.get("internalReference") or "default"
+    health = classic_feature("Health", True, lambda: local.health(ref))
+    wan, www = subsystem(health, "wan"), subsystem(health, "www")
+    gateway = find_gateway(devices, wan)
     gw_stats = {}
     if gateway and gateway.get("state") == "ONLINE":
         try:
@@ -463,17 +491,22 @@ def build_dashboard(config, local=None, cloud_api=None):  # pylint: disable=too-
     aps.sort(key=lambda a: (-a["c"], a["n"]))
 
     offline = [d for d in devices if d.get("state") != "ONLINE"]
-    cloud = build_cloud(config, site, cloud_api)
+    gateway_mac = (gateway or {}).get("macAddress") or wan.get("gw_mac", "")
+    cloud = build_cloud(config, site, cloud_api, gateway_mac)
     uplink = gw_stats.get("uplink") or {}
+    gw_system = wan.get("gw_system-stats") or {}
+    # Classic health reports WAN rates in bytes/s; the official uplink rate is the fallback.
+    down_bps = to_float(wan.get("rx_bytes-r"))
+    up_bps = to_float(wan.get("tx_bytes-r"))
     dashboard = {
         "status": "ok",
         "updated": int(time.time()),
         "time": datetime.now().strftime(config.time_format).lstrip("0"),
         "site": site.get("name", ""),
-        "internet": internet_status(cloud, gateway),
-        "isp": cloud.get("isp", ""),
+        "internet": internet_status(cloud, gateway, www),
+        "isp": cloud.get("isp") or wan.get("isp_name", ""),
         "wan_uptime": cloud.get("wan_uptime"),
-        "latency": cloud.get("latency"),
+        "latency": cloud.get("latency") if cloud.get("latency") is not None else www.get("latency"),
         "latency_avg": cloud.get("latency_avg"),
         "latency_max": cloud.get("latency_max"),
         "loss": cloud.get("loss"),
@@ -481,13 +514,13 @@ def build_dashboard(config, local=None, cloud_api=None):  # pylint: disable=too-
         "lossy": cloud.get("lossy"),
         "alerts": cloud.get("alerts", 0),
         "lat": cloud.get("lat", []),
-        # The gateway's uplink is the WAN: rx is download, tx is upload.
-        "down": mbps(uplink.get("rxRateBps")),
-        "up": mbps(uplink.get("txRateBps")),
-        "gateway": short(gateway.get("name") or gateway.get("model")) if gateway else "",
-        "cpu": pct(gw_stats.get("cpuUtilizationPct")),
-        "mem": pct(gw_stats.get("memoryUtilizationPct")),
-        "uptime": duration(gw_stats.get("uptimeSec")),
+        # WAN rx is download, tx is upload.
+        "down": mbps(down_bps * 8) if down_bps is not None else mbps(uplink.get("rxRateBps")),
+        "up": mbps(up_bps * 8) if up_bps is not None else mbps(uplink.get("txRateBps")),
+        "gateway": short(gateway.get("name") or gateway.get("model")) if gateway else short(wan.get("gw_name")),
+        "cpu": pct(first_number(gw_stats.get("cpuUtilizationPct"), gw_system.get("cpu"))),
+        "mem": pct(first_number(gw_stats.get("memoryUtilizationPct"), gw_system.get("mem"))),
+        "uptime": duration(first_number(gw_stats.get("uptimeSec"), gw_system.get("uptime"))),
         "clients": count_clients(clients),
         "devices": len(devices),
         "online": len(devices) - len(offline),
@@ -496,7 +529,7 @@ def build_dashboard(config, local=None, cloud_api=None):  # pylint: disable=too-
         "updates": sum(1 for d in devices if d.get("firmwareUpdatable")),
         "aps": aps[:MAX_APS],
         "poe": build_poe(config, local, site),
-        "speedtest": build_speedtest(config, local, site),
+        "speedtest": summarize_speedtest(health) if config.show_speedtest and health else None,
     }
     return dashboard
 
@@ -576,11 +609,21 @@ def run_server(config):
     ThreadingHTTPServer((config.listen_host, config.port), Handler).serve_forever()
 
 
+def gateway_summary(local, ref):
+    wan = subsystem(local.health(ref), "wan")
+    stats = wan.get("gw_system-stats") or {}
+    if not wan.get("gw_mac"):
+        return None
+    return {"name": wan.get("gw_name"), "mac": wan.get("gw_mac"), "cpu": stats.get("cpu"),
+            "mem": stats.get("mem"), "isp": wan.get("isp_name")}
+
+
 def check_classic(config, local, ref):
     """Reports whether the optional classic-API features work with this key."""
     checks = (("PoE", config.show_poe, lambda: summarize_poe(local.legacy_devices(ref)), "no PoE devices found"),
               ("Speedtest", config.show_speedtest, lambda: summarize_speedtest(local.health(ref)),
-               "no speed test has run yet"))
+               "no speed test has run yet"),
+              ("Gateway", True, lambda: gateway_summary(local, ref), "not found in classic health"))
     for name, enabled, fetch, empty in checks:
         if not enabled:
             continue
@@ -600,7 +643,12 @@ def run_check(config):
         site = local.site(config.site)
         devices = local.get_all(f"/sites/{site['id']}/devices")
         print(f"  site: {site.get('name')} ({site.get('internalReference')}), {len(devices)} devices")
-        check_classic(config, local, site.get("internalReference") or "default")
+        ref = site.get("internalReference") or "default"
+        check_classic(config, local, ref)
+        try:
+            gateway_mac = subsystem(local.health(ref), "wan").get("gw_mac", "")
+        except (requests.RequestException, ValueError):
+            gateway_mac = ""
     except (requests.RequestException, ValueError, RuntimeError) as error:
         print(f"  local API FAILED: {error}")
         return False
@@ -609,12 +657,13 @@ def run_check(config):
         return ok
     try:
         sites = CloudApi(config).sites()
-        match = pick_cloud_site(sites, site, config.cloud_site_id)
+        match = pick_cloud_site(sites, site, config.cloud_site_id, gateway_mac)
         print(f"Cloud API: {len(sites)} site(s)")
         for cloud_site in sites:
             meta = cloud_site.get("meta") or {}
             mark = "*" if cloud_site is match else " "
-            print(f"  {mark} {cloud_site.get('siteId')}  {meta.get('desc', '')} ({meta.get('name', '')})")
+            print(f"  {mark} {cloud_site.get('siteId')}  {meta.get('desc', '')} ({meta.get('name', '')})"
+                  f"  gateway {meta.get('gatewayMac', '?')}")
         if match is None:
             print("  No match; set UNIFI_CLOUD_SITE_ID to one of the ids above")
             ok = False

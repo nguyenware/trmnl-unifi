@@ -20,11 +20,11 @@ a compact summary to a TRMNL *webhook* private plugin. No port forwarding or tun
 
 | On screen | Source |
 |---|---|
-| Online / Degraded / Offline | gateway state (local) + internet issues and packet loss (cloud) |
+| Online / Degraded / Offline | gateway state and internet status (local) + internet issues and packet loss (cloud) |
 | ISP, WAN uptime % | Site Manager `GET /v1/sites` |
 | Latency now, 24h chart, packet loss | Site Manager `GET /v1/isp-metrics/5m?duration=24h` |
-| ↓ / ↑ Mbps now | gateway `statistics/latest` → `uplink.rxRateBps` / `txRateBps` |
-| CPU, memory, gateway uptime | gateway `statistics/latest` |
+| ↓ / ↑ Mbps now | WAN rates from classic `stat/health`, else gateway `statistics/latest` → `uplink` |
+| CPU, memory, gateway uptime | gateway `statistics/latest`, else classic `stat/health` |
 | Clients (Wi-Fi / wired / VPN / guest) | `GET /v1/sites/{id}/clients` |
 | Devices online, offline devices, updates | `GET /v1/sites/{id}/devices` (`state`, `firmwareUpdatable`) |
 | Clients and Tx retry % per access point | clients' `uplinkDeviceId` + each AP's `statistics/latest` |
@@ -40,6 +40,11 @@ The official APIs don't expose Wi-Fi signal strength or per-client bandwidth, so
 report PoE watts (only whether a port supplies power) or speed test results. UniFi OS accepts the same
 API key there, but Ubiquiti doesn't guarantee that. If your console rejects it, `check` says so, one line
 is logged, and the dashboard shows everything else.
+
+The classic `stat/health` data also fills gaps in the official API: some consoles (a UDM Pro SE on
+Network 10.6, for one) don't mark themselves as a gateway in the official device list, so the gateway is
+found by the MAC address in `stat/health`, which also supplies its CPU, memory, WAN rates and internet
+status. The same MAC picks the right cloud site when several consoles each have a "Default" site.
 
 - Switches report a PoE budget (`total_max_power`); gateways may not, so their PoE draw is shown as
   "+N W" beside the bar rather than in it.
@@ -105,7 +110,7 @@ journalctl -u trmnl-unifi -f      # expect "Pushed internet=up latency=..." ever
 | `UNIFI_CLOUD_API_KEY` | – | Site Manager key. Adds ISP, WAN uptime, latency and packet loss. |
 | `SHOW_POE` | `1` | `0` stops reading PoE from the classic API. |
 | `SHOW_SPEEDTEST` | `1` | `0` stops reading speed test results from the classic API. |
-| `UNIFI_CLOUD_SITE_ID` | auto | Only needed with several consoles if `check` can't match the site. |
+| `UNIFI_CLOUD_SITE_ID` | auto | Matched by the gateway's MAC address. Only needed if `check` still can't match the site. |
 | `PUSH_INTERVAL` | `300` | Seconds. TRMNL allows 12 webhook posts per hour (30 with TRMNL+), so don't go below 300 (120 with TRMNL+). |
 | `PAYLOAD_LIMIT` | `2048` | Webhook body limit in bytes; `5120` with TRMNL+. A typical payload is under 1 KB. |
 | `TIME_FORMAT` | `%I:%M %p` | Update time in the title bar, in this machine's time zone. |
