@@ -464,3 +464,39 @@ def test_status_reasons(config):
 def test_mbps_rounding():
     assert ud.mbps(9_440_000) == 9.4
     assert ud.mbps(20_040_000) == 20
+
+
+# Seen on a live UDM Pro SE: a WAN outage ~19.7h before this run, and the 5-minute period after it.
+REAL_NOW = 1_790_751_181
+REAL_ISSUES = [{"index": 5968934, "wanDowntime": True}, {"index": 5968935}]
+
+
+def test_old_issues_are_history_not_status():
+    split = ud.split_issues(REAL_ISSUES, REAL_NOW)
+    assert split == {"issues": [], "last_issue": "WAN down 19h ago"}
+
+
+def test_recent_issue_is_current():
+    now_index = REAL_NOW // 300
+    split = ud.split_issues([{"index": now_index - 1, "wanDowntime": True}], REAL_NOW)
+    assert len(split["issues"]) == 1 and split["last_issue"].startswith("WAN down")
+    assert ud.describe_issues(split["issues"]) == "WAN down"
+
+
+def test_unrecognised_issue_format_counts_as_current():
+    weird = [{"index": 42}, {"wanId": "WAN"}, "text", {"index": True}]
+    assert ud.split_issues(weird, REAL_NOW) == {"issues": weird, "last_issue": ""}
+
+
+def test_dashboard_up_with_last_issue(config, monkeypatch):
+    monkeypatch.setattr(ud.time, "time", lambda: REAL_NOW)
+    dash = build(config, cloud=cloud_routes(issues=REAL_ISSUES))
+    assert dash["internet"] == "up"
+    assert dash["why"] == "WAN down 19h ago"
+
+
+def test_current_issue_degrades(config, monkeypatch):
+    monkeypatch.setattr(ud.time, "time", lambda: REAL_NOW)
+    issues = [{"index": REAL_NOW // 300, "wanDowntime": True}]
+    dash = build(config, cloud=cloud_routes(issues=issues))
+    assert (dash["internet"], dash["why"]) == ("degraded", "WAN down")

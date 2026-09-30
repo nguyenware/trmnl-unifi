@@ -6,7 +6,7 @@ UniFi dashboard - compact layout for Half / Quadrant mashup slots.
   <span class="value value--small" style="white-space: nowrap;">
     {% case internet %}{% when "up" %}✓ Online{% when "degraded" %}! Degraded{% when "down" %}✗ Offline{% else %}Online{% endcase %}
   </span>
-  {% if why and why != "" %}<span class="description clamp--1">{{ why }}</span>{% endif %}
+  {% if why and why != "" %}<span class="description" style="white-space: nowrap;">{{ why }}</span>{% endif %}
   <span class="label">{% if latency %}{{ latency }} ms{% endif %}{% if loss and loss > 0 %} · {{ loss }}% loss{% endif %} · ↓{{ down | default: "–" }} ↑{{ up | default: "–" }} Mbps</span>
   <span class="description">
     {{ clients.total }} clients · {{ online }}/{{ devices }} devices

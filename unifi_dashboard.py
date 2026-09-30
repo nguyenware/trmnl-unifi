@@ -37,6 +37,8 @@ LATENCY_POINTS = 48  # 24h of 5-minute samples averaged into 30-minute buckets
 MAX_LISTED = 4  # offline devices named on screen
 MAX_APS = 6
 NAME_LEN = 18
+ISSUE_PERIOD = 300  # internetIssues "index" counts 5-minute periods since the Unix epoch
+CURRENT_ISSUE_SEC = 15 * 60  # issues newer than this affect the headline; older ones are history
 POE_HOT_PCT = 80  # name a device on screen once its PoE draw reaches this share of its budget
 
 
@@ -304,7 +306,7 @@ def fetch_cloud(config, local_site, cloud, gateway_mac=""):
     result = {
         "isp": (stats.get("ispInfo") or {}).get("name", ""),
         "wan_uptime": (stats.get("percentages") or {}).get("wanUptime"),
-        "issues": stats.get("internetIssues") or [],
+        **split_issues(stats.get("internetIssues") or []),
         "alerts": counts.get("criticalNotification", 0),
         "gateway_offline": counts.get("offlineGatewayDevice", 0),
     }
@@ -435,8 +437,40 @@ def find_gateway(devices, wan):
     return next((d for d in devices if norm_mac(d.get("macAddress")) == norm_mac(wan["gw_mac"])), None)
 
 
+def split_issues(issues, now=None):
+    """Separates current internet issues from ones earlier in the day.
+
+    The Site Manager API lists a site's issues for roughly the last day, e.g.
+    [{"index": 5968934, "wanDowntime": true}, {"index": 5968935}]. The format
+    isn't documented; on a live UDM Pro SE, index * 300 matched the time of a
+    WAN outage ~20h earlier, so index is read as a 5-minute period number.
+    Issues without a plausible index are treated as current, so an
+    unrecognised format still degrades the status rather than hiding it.
+    """
+    now = time.time() if now is None else now
+    current, dated = [], []
+    for issue in issues:
+        index = issue.get("index") if isinstance(issue, dict) else None
+        when = index * ISSUE_PERIOD if isinstance(index, (int, float)) and not isinstance(index, bool) else None
+        if when is None or not now - 7 * 86400 <= when <= now + ISSUE_PERIOD:
+            current.append(issue)
+            continue
+        if now - when <= CURRENT_ISSUE_SEC:
+            current.append(issue)
+        dated.append((when, bool(issue.get("wanDowntime"))))
+    if not dated:
+        return {"issues": current, "last_issue": ""}
+    # Consecutive periods are one event: call it WAN down if any period near the latest one was.
+    latest = max(when for when, _ in dated)
+    wan_down = any(down for when, down in dated if latest - when <= 1800)
+    label = "WAN down" if wan_down else "Internet issue"
+    return {"issues": current, "last_issue": f"{label} {ago(max(0, now - latest))} ago"}
+
+
 def describe_issues(issues):
     """A short reason from the cloud's internetIssues list, whose item format isn't documented."""
+    if any(isinstance(i, dict) and i.get("wanDowntime") for i in issues):
+        return "WAN down"
     for issue in issues:
         for key in ("type", "reason", "name", "issue", "title"):
             if isinstance(issue, dict) and isinstance(issue.get(key), str) and issue[key]:
@@ -520,7 +554,7 @@ def build_dashboard(config, local=None, cloud_api=None):  # pylint: disable=too-
         "time": datetime.now().strftime(config.time_format).lstrip("0"),
         "site": site.get("name", ""),
         "internet": status,
-        "why": why,
+        "why": why or cloud.get("last_issue", ""),
         "isp": cloud.get("isp") or wan.get("isp_name", ""),
         "wan_uptime": cloud.get("wan_uptime"),
         "latency": cloud.get("latency") if cloud.get("latency") is not None else www.get("latency"),
@@ -697,6 +731,8 @@ def run_check(config):
         else:
             issues = (match.get("statistics") or {}).get("internetIssues") or []
             print(f"  internetIssues: {json.dumps(issues)[:600]}")
+            split = split_issues(issues)
+            print(f"    current: {len(split['issues'])}, last: {split['last_issue'] or 'none'}")
     except (requests.RequestException, ValueError) as error:
         print(f"  cloud API FAILED: {error}")
         ok = False
