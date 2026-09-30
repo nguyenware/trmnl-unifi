@@ -1,5 +1,8 @@
+import contextlib
 import json
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
 import pytest
@@ -500,3 +503,47 @@ def test_current_issue_degrades(config, monkeypatch):
     issues = [{"index": REAL_NOW // 300, "wanDowntime": True}]
     dash = build(config, cloud=cloud_routes(issues=issues))
     assert (dash["internet"], dash["why"]) == ("degraded", "WAN down")
+
+
+
+@contextlib.contextmanager
+def console_answering(statuses):
+    """A real local HTTP server that answers each GET with the next status (the last one repeats)."""
+    hits = []
+    body = json.dumps(page([{"id": SITE_ID, "internalReference": "default", "name": "Default"}])).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # pylint: disable=invalid-name
+            status = statuses[min(len(hits), len(statuses) - 1)]
+            hits.append(status)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body if status == 200 else b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", hits
+    finally:
+        server.shutdown()
+
+
+def test_local_api_retries_temporary_503(config, monkeypatch):
+    monkeypatch.setattr(ud, "RETRY_BACKOFF", 0)
+    with console_answering([503, 503, 200]) as (url, hits):  # Network app restarting, then back
+        config.host = url
+        assert ud.LocalApi(config).site()["name"] == "Default"
+        assert hits == [503, 503, 200]
+
+
+def test_local_api_gives_up_after_retries(config, monkeypatch):
+    monkeypatch.setattr(ud, "RETRY_BACKOFF", 0)
+    with console_answering([503]) as (url, hits):
+        config.host = url
+        with pytest.raises(ud.requests.HTTPError, match="503"):
+            ud.LocalApi(config).site()
+        assert len(hits) == 4  # the first try plus 3 retries

@@ -28,6 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -39,7 +41,11 @@ MAX_APS = 6
 NAME_LEN = 18
 ISSUE_PERIOD = 300  # internetIssues "index" counts 5-minute periods since the Unix epoch
 CURRENT_ISSUE_SEC = 15 * 60  # issues newer than this affect the headline; older ones are history
-POE_HOT_PCT = 80  # name a device on screen once its PoE draw reaches this share of its budget
+POE_HOT_PCT = 80
+# The console answers 502/503/504 while the Network application restarts or updates;
+# retry a few times (waits of 0, 2 and 4 s) before giving up on this update.
+RETRY_STATUSES = (502, 503, 504)
+RETRY_BACKOFF = 1  # name a device on screen once its PoE draw reaches this share of its budget
 
 
 def load_dotenv(path):
@@ -90,6 +96,17 @@ class Config:  # pylint: disable=too-many-instance-attributes,too-few-public-met
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
+def retrying_session():
+    """A requests session that retries GETs on connection errors and 502/503/504."""
+    retry = Retry(total=3, backoff_factor=RETRY_BACKOFF, backoff_max=15, status_forcelist=RETRY_STATUSES,
+                  allowed_methods=frozenset(["GET"]), raise_on_status=False, respect_retry_after_header=False)
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 class LocalApi:
     """The UniFi Network Integration API on the console."""
 
@@ -98,7 +115,7 @@ class LocalApi:
             raise SystemExit("UNIFI_HOST and UNIFI_API_KEY are required")
         self.base = f"{config.host}/proxy/network/integration/v1"
         self.legacy_base = f"{config.host}/proxy/network/api"
-        self.session = session or requests.Session()
+        self.session = session or retrying_session()
         self.session.headers.update({"X-API-Key": config.api_key, "Accept": "application/json"})
         self.session.verify = config.verify
 
@@ -153,7 +170,7 @@ class CloudApi:
     """The Site Manager API at api.ui.com (read-only key from unifi.ui.com)."""
 
     def __init__(self, config, session=None):
-        self.session = session or requests.Session()
+        self.session = session or retrying_session()
         self.session.headers.update({"X-API-Key": config.cloud_key, "Accept": "application/json"})
 
     def get(self, path, **params):
