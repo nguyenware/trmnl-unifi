@@ -35,6 +35,9 @@ private plugin (Full tab). Variables come from unifi_dashboard.py.
       <div class="item"><div class="meta"></div><div class="content">
         <span class="value value--tnums uf-nowrap">↓{{ down | default: "–" }} ↑{{ up | default: "–" }}</span>
         <span class="label">Mbps now</span>
+        {% if speedtest %}
+        <span class="description uf-nowrap">{% if speedtest.ok %}Speed test ↓{{ speedtest.down }} ↑{{ speedtest.up }}{% if speedtest.ping %} · {{ speedtest.ping }} ms{% endif %}{% else %}Speed test failed{% endif %} · {{ speedtest.ago }} ago</span>
+        {% endif %}
       </div></div>
     </div>
   </div>

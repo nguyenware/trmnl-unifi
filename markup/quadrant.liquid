@@ -10,6 +10,7 @@ UniFi dashboard - compact layout for Half / Quadrant mashup slots.
   <span class="description">
     {{ clients.total }} clients · {{ online }}/{{ devices }} devices
   </span>
+  {% if speedtest and speedtest.ok %}<span class="description">Speed test ↓{{ speedtest.down }} ↑{{ speedtest.up }} · {{ speedtest.ago }} ago</span>{% endif %}
   {% if offline.size > 0 %}<span class="description clamp--1">✗ {{ offline | first }}</span>{% endif %}
   {% if poe and poe.hot != "" %}<span class="description clamp--1">! PoE {{ poe.hot }}</span>{% endif %}
 {% else %}

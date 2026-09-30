@@ -1,4 +1,5 @@
 import json
+import time
 from urllib.parse import urlparse
 
 import pytest
@@ -55,6 +56,19 @@ def client(kind, uplink=None, access="DEFAULT"):
 
 LOCAL_BASE = "/proxy/network/integration/v1"
 LEGACY_DEVICES = "/proxy/network/api/s/default/stat/device"
+LEGACY_HEALTH = "/proxy/network/api/s/default/stat/health"
+
+
+def www_health(last_run, down=999.0, up=1017.0, status="Success"):
+    # Shaped like a real UniFi OS stat/health "www" entry (unpoller endpoints_data/stat-health.json).
+    return {"subsystem": "www", "status": "ok", "latency": 9, "uptime": 492506, "drops": 1,
+            "xput_up": up, "xput_down": down, "speedtest_status": status,
+            "speedtest_lastrun": last_run, "speedtest_ping": 10}
+
+
+def health_route(_params):
+    return {"meta": {"rc": "ok"}, "data": [{"subsystem": "wlan", "status": "ok"},
+                                           www_health(time.time() - 3 * 3600 - 60)]}
 
 
 def poe_port(idx, watts, poe=True):
@@ -86,6 +100,7 @@ def local_routes(devices=None, clients=None):
         f"{LOCAL_BASE}/sites/{SITE_ID}/devices": page(devices),
         f"{LOCAL_BASE}/sites/{SITE_ID}/clients": page(clients),
         LEGACY_DEVICES: LEGACY,
+        LEGACY_HEALTH: health_route,
         f"{LOCAL_BASE}/sites/{SITE_ID}/devices/{GW}/statistics/latest": {
             "uptimeSec": 3 * 86400 + 5 * 3600, "cpuUtilizationPct": 12.4, "memoryUtilizationPct": 61.6,
             "uplink": {"rxRateBps": 245_600_000, "txRateBps": 12_300_000}},
@@ -166,6 +181,7 @@ def test_dashboard_end_to_end(config):
                            {"n": "Garage AP", "c": 0, "on": False}]
     assert len(dash["lat"]) == 48
     assert dash["poe"] == {"w": 87, "max": 400, "pct": 22, "other": 12, "hot": ""}
+    assert dash["speedtest"] == {"down": 999, "up": 1017, "ping": 10, "ago": "3h", "ok": True}
 
 
 def test_dashboard_without_cloud_key(config):
@@ -312,7 +328,7 @@ def test_no_poe_devices():
 def test_classic_api_rejected_skips_poe(config, capsys):
     routes = local_routes()
     del routes[LEGACY_DEVICES]  # 404, like a console that refuses the key there
-    ud._POE_WARNED.clear()
+    ud._WARNED.clear()
     first = build(config, local=routes)
     second = build(config, local=routes)
     assert first["poe"] is None and second["poe"] is None
@@ -327,3 +343,32 @@ def test_show_poe_off_skips_classic_api(config):
     dash = ud.build_dashboard(config, ud.LocalApi(config, session))
     assert dash["poe"] is None
     assert LEGACY_DEVICES not in [path for path, _ in session.calls]
+
+
+def test_speedtest_summary():
+    now = 1_769_700_000
+    health = [{"subsystem": "wan"}, www_health(now - 25 * 60, down=236.4, up=11.6)]
+    assert ud.summarize_speedtest(health, now) == {"down": 236, "up": 12, "ping": 10, "ago": "25m", "ok": True}
+    failed = [www_health(now - 2 * 86400 - 5, status="Failed")]
+    assert ud.summarize_speedtest(failed, now)["ok"] is False
+    assert ud.summarize_speedtest(failed, now)["ago"] == "2d"
+
+
+def test_speedtest_never_run():
+    assert ud.summarize_speedtest([{"subsystem": "www", "status": "ok", "latency": 9}]) is None
+    assert ud.summarize_speedtest([www_health(0)]) is None
+    assert ud.summarize_speedtest([www_health(1_769_686_425, down=0, up=0)]) is None
+    assert ud.summarize_speedtest([]) is None
+
+
+def test_ago():
+    assert [ud.ago(s) for s in (5, 90, 3 * 3600, 3 * 86400)] == ["now", "1m", "3h", "3d"]
+
+
+def test_classic_api_rejected_skips_speedtest(config, capsys):
+    routes = local_routes()
+    del routes[LEGACY_HEALTH]
+    ud._WARNED.clear()
+    dash = build(config, local=routes)
+    assert dash["speedtest"] is None and dash["poe"] is not None
+    assert "set SHOW_SPEEDTEST=0" in capsys.readouterr().err

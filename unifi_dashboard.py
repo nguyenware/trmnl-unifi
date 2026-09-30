@@ -80,6 +80,7 @@ class Config:  # pylint: disable=too-many-instance-attributes,too-few-public-met
         self.interval = int(os.environ.get("PUSH_INTERVAL", "") or 300)
         self.payload_limit = int(os.environ.get("PAYLOAD_LIMIT", "") or 2048)
         self.show_poe = env_flag("SHOW_POE", True)
+        self.show_speedtest = env_flag("SHOW_SPEEDTEST", True)
         self.time_format = os.environ.get("TIME_FORMAT", "%I:%M %p")
         self.listen_host = os.environ.get("HOST", "0.0.0.0")
         self.port = int(os.environ.get("PORT", "") or 5000)
@@ -115,15 +116,21 @@ class LocalApi:
             if not data or offset >= page.get("totalCount", 0):
                 return items
 
-    def legacy_devices(self, site_ref):
-        """Raw devices from the undocumented classic API, the only source of PoE watts.
+    def classic(self, site_ref, path):
+        """Data from the undocumented classic API, the only source of PoE watts and speed tests.
 
         UniFi OS accepts the same X-API-Key here, but Ubiquiti doesn't document
         or guarantee it.
         """
-        response = self.session.get(f"{self.legacy_base}/s/{site_ref}/stat/device", timeout=20)
+        response = self.session.get(f"{self.legacy_base}/s/{site_ref}{path}", timeout=20)
         response.raise_for_status()
         return response.json().get("data") or []
+
+    def legacy_devices(self, site_ref):
+        return self.classic(site_ref, "/stat/device")
+
+    def health(self, site_ref):
+        return self.classic(site_ref, "/stat/health")
 
     def site(self, wanted=""):
         """The site matching UNIFI_SITE (name, internal reference or id), else the first one."""
@@ -346,23 +353,64 @@ def summarize_poe(legacy_devices):
     }
 
 
-_POE_WARNED = []
+def ago(seconds):
+    """How long ago, compactly: now, 25m, 3h, 2d."""
+    if seconds < 60:
+        return "now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+def summarize_speedtest(health, now=None):
+    """Latest gateway speed test from the "www" entry of classic /stat/health, or None if never run."""
+    www = next((h for h in health if h.get("subsystem") == "www"), {})
+    last_run = to_float(www.get("speedtest_lastrun"))
+    down, up = to_float(www.get("xput_down")), to_float(www.get("xput_up"))
+    if not last_run or (not down and not up):
+        return None
+    now = time.time() if now is None else now
+    return {
+        "down": round(down or 0),
+        "up": round(up or 0),
+        "ping": round(to_float(www.get("speedtest_ping")) or 0) or None,
+        "ago": ago(max(0, now - last_run)),
+        "ok": (www.get("speedtest_status") or "Success").lower() == "success",
+    }
+
+
+_WARNED = set()
+
+
+def classic_feature(name, enabled, fetch):
+    """Runs an optional classic-API feature; failures are logged once per outage and give None."""
+    if not enabled:
+        return None
+    try:
+        result = fetch()
+        _WARNED.discard(name)
+        return result
+    except (requests.RequestException, ValueError) as error:
+        if name not in _WARNED:  # once per outage, not every push
+            flag = "SHOW_" + name.upper().replace(" ", "")
+            print(f"{name} data unavailable (classic API): {error}; set {flag}=0 to stop trying",
+                  file=sys.stderr, flush=True)
+            _WARNED.add(name)
+        return None
 
 
 def build_poe(config, local, site):
     """PoE summary, or None if disabled or the classic API isn't reachable with the key."""
-    if not config.show_poe:
-        return None
-    try:
-        poe = summarize_poe(local.legacy_devices(site.get("internalReference") or "default"))
-        _POE_WARNED.clear()
-        return poe
-    except (requests.RequestException, ValueError) as error:
-        if not _POE_WARNED:  # once per outage, not every push
-            print(f"PoE data unavailable (classic API): {error}; set SHOW_POE=0 to stop trying",
-                  file=sys.stderr, flush=True)
-            _POE_WARNED.append(True)
-        return None
+    ref = site.get("internalReference") or "default"
+    return classic_feature("PoE", config.show_poe, lambda: summarize_poe(local.legacy_devices(ref)))
+
+
+def build_speedtest(config, local, site):
+    """Last speed test, or None if disabled, never run, or the classic API isn't reachable."""
+    ref = site.get("internalReference") or "default"
+    return classic_feature("Speedtest", config.show_speedtest, lambda: summarize_speedtest(local.health(ref)))
 
 
 def internet_status(cloud, gateway):
@@ -448,6 +496,7 @@ def build_dashboard(config, local=None, cloud_api=None):  # pylint: disable=too-
         "updates": sum(1 for d in devices if d.get("firmwareUpdatable")),
         "aps": aps[:MAX_APS],
         "poe": build_poe(config, local, site),
+        "speedtest": build_speedtest(config, local, site),
     }
     return dashboard
 
@@ -527,6 +576,21 @@ def run_server(config):
     ThreadingHTTPServer((config.listen_host, config.port), Handler).serve_forever()
 
 
+def check_classic(config, local, ref):
+    """Reports whether the optional classic-API features work with this key."""
+    checks = (("PoE", config.show_poe, lambda: summarize_poe(local.legacy_devices(ref)), "no PoE devices found"),
+              ("Speedtest", config.show_speedtest, lambda: summarize_speedtest(local.health(ref)),
+               "no speed test has run yet"))
+    for name, enabled, fetch, empty in checks:
+        if not enabled:
+            continue
+        try:
+            result = fetch()
+            print(f"  {name}: {result}" if result else f"  {name}: {empty}")
+        except (requests.RequestException, ValueError) as error:
+            print(f"  {name}: classic API not available with this key ({error}); set SHOW_{name.upper()}=0")
+
+
 def run_check(config):
     """Tests both APIs and prints what was found."""
     ok = True
@@ -536,12 +600,7 @@ def run_check(config):
         site = local.site(config.site)
         devices = local.get_all(f"/sites/{site['id']}/devices")
         print(f"  site: {site.get('name')} ({site.get('internalReference')}), {len(devices)} devices")
-        if config.show_poe:
-            try:
-                poe = summarize_poe(local.legacy_devices(site.get("internalReference") or "default"))
-                print(f"  PoE: {poe}" if poe else "  PoE: no PoE devices found")
-            except (requests.RequestException, ValueError) as error:
-                print(f"  PoE: classic API not available with this key ({error}); set SHOW_POE=0")
+        check_classic(config, local, site.get("internalReference") or "default")
     except (requests.RequestException, ValueError, RuntimeError) as error:
         print(f"  local API FAILED: {error}")
         return False
